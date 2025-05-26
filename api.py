@@ -47,7 +47,9 @@ def _make_column_names():
     ]
 
     whole_db.execute("SELECT DISTINCT party_cd FROM whole ORDER BY party_cd")
-    party_enum = enum.StrEnum("Parties", [(row[0], row[0]) for row in whole_db.fetchall()])
+    party_enum = enum.StrEnum(
+        "Parties", [(row[0], row[0]) for row in whole_db.fetchall()]
+    )
 
     # close connection
     next(db_dep, None)
@@ -340,12 +342,16 @@ class StatsResponse(pydantic.BaseModel):
 # XXX some of these may be more useful as arrays and not scalars
 #     e.g. get stats for multiple precincts at once
 
-@app.get("/counties/{county_id}/precinct/{precinct_id}/stats", response_model_exclude_none=True)
+
+@app.get(
+    "/counties/{county_id}/precinct/{precinct_id}/stats",
+    response_model_exclude_none=True,
+)
 def get_county_precinct_stats(
-        county_id: int,
-        precinct_id: str,
-        stats_params: Annotated[StatsParams, Query()],
-        whole_db: Annotated[duckdb.DuckDBPyConnection, Depends(get_whole_db)],
+    county_id: int,
+    precinct_id: str,
+    stats_params: Annotated[StatsParams, Query()],
+    whole_db: Annotated[duckdb.DuckDBPyConnection, Depends(get_whole_db)],
 ) -> list[StatsResponse]:
     sql_named_params = {
         "county_id": county_id,
@@ -399,11 +405,8 @@ def get_county_precinct_stats(
     ORDER BY {agg_cols_str}, freq DESC
     """
 
-
     def _row_formatter(row):
-        kwargs = {
-            "freq": row[0]
-        }
+        kwargs = {"freq": row[0]}
         for col_idx, colname in enumerate(agg_cols):
             kwargs[colname] = row[col_idx + 1]
         return StatsResponse(**kwargs)
