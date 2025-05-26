@@ -1,5 +1,5 @@
 import os
-from typing import Annotated
+from typing import Annotated, Literal
 import datetime
 import csv
 import io
@@ -46,6 +46,9 @@ def _make_column_names():
         (row[0], row[0]) for row in whole_db.fetchall() if row[0] not in addl_delta_cols
     ]
 
+    whole_db.execute("SELECT DISTINCT party_cd FROM whole ORDER BY party_cd")
+    party_enum = enum.StrEnum("Parties", [(row[0], row[0]) for row in whole_db.fetchall()])
+
     # close connection
     next(db_dep, None)
 
@@ -55,10 +58,10 @@ def _make_column_names():
     delta_col_enum = enum.StrEnum("DeltaColumnNames", delta_cols)
     whole_col_enum = enum.StrEnum("WholeColumnNames", whole_cols)
 
-    return delta_col_enum, whole_col_enum
+    return delta_col_enum, whole_col_enum, party_enum
 
 
-DeltaColumnNames, WholeColumnNames = _make_column_names()
+DeltaColumnNames, WholeColumnNames, Parties = _make_column_names()
 
 
 class DeltaCsvParams(pydantic.BaseModel):
@@ -259,4 +262,153 @@ def get_county_precinct_delta_days(
             """,
             [county_id, precinct_id],
         ).fetchall()
+    ]
+
+
+class Generation(enum.Enum):
+    ww2 = "ww2"
+    postwar = "postwar"
+    boomer1 = "boomer1"
+    boomer2 = "boomer2"
+    genx = "genx"
+    millennial = "millennial"
+    zoomer = "zoomer"
+    gena = "gena"
+
+
+class Race(enum.Enum):
+    A = "A"
+    B = "B"
+    I = "I"
+    M = "M"
+    O = "O"
+    P = "P"
+    U = "U"
+    W = "W"
+
+
+class Ethnicity(enum.Enum):
+    HL = "HL"
+    NL = "NL"
+    UN = "UN"
+
+
+race_desc = {
+    Race.A: "Asian",
+    Race.B: "Black",
+    Race.I: "American Indian or Alaskan Native",
+    Race.M: "Two or more",
+    Race.O: "Other",
+    Race.P: "Hawaiian or Pacific Islander",
+    Race.U: "Undesignated",
+    Race.W: "White",
+}
+
+ethnicity_desc = {
+    Ethnicity.HL: "Hispanic/Latino",
+    Ethnicity.NL: "Non-Hispanic/Latino",
+    Ethnicity.UN: "Undesignated",
+}
+
+
+class Aggregates(enum.StrEnum):
+    generation = "generation"
+    party = "party"
+    has_phone = "has_phone"
+    race = "race"
+    ethnicity = "ethnicity"
+
+
+class StatsParams(pydantic.BaseModel):
+    aggs: list[Aggregates] | None = pydantic.Field(None)
+    generation: Generation | None = pydantic.Field(None)
+    party: Parties | None = pydantic.Field(None)
+    has_phone: bool | None = pydantic.Field(None)
+    race: Race | None = pydantic.Field(None)
+    ethnicity: Ethnicity | None = pydantic.Field(None)
+
+
+class StatsResponse(pydantic.BaseModel):
+    freq: int
+    generation: Generation | None = pydantic.Field(None)
+    party: Parties | None = pydantic.Field(None)
+    has_phone: bool | None = pydantic.Field(None)
+    race: Race | None = pydantic.Field(None)
+    ethnicity: Ethnicity | None = pydantic.Field(None)
+
+
+# XXX some of these may be more useful as arrays and not scalars
+#     e.g. get stats for multiple precincts at once
+
+@app.get("/counties/{county_id}/precinct/{precinct_id}/stats", response_model_exclude_none=True)
+def get_county_precinct_stats(
+        county_id: int,
+        precinct_id: str,
+        stats_params: Annotated[StatsParams, Query()],
+        whole_db: Annotated[duckdb.DuckDBPyConnection, Depends(get_whole_db)],
+) -> list[StatsResponse]:
+    sql_named_params = {
+        "county_id": county_id,
+        "precinct_id": precinct_id,
+    }
+
+    agg_cols = stats_params.aggs
+    if not agg_cols:
+        agg_cols = list(Aggregates)
+    agg_cols_str = ",".join(col.value for col in agg_cols)
+
+    preds = []
+
+    for attr_name in ("generation", "party", "has_phone", "race", "ethnicity"):
+        if attr_val := getattr(stats_params, attr_name):
+            preds.append(f"{attr_name} = ${attr_name}")
+            sql_named_params[attr_name] = attr_val.value
+
+    preds_str = ""
+    if preds:
+        preds_str = " AND " + " AND ".join(preds)
+
+    inner_query = """
+    SELECT
+        county_id,
+        precinct_abbrv as precinct_id,
+        CASE
+            WHEN birth_year <= 1927 THEN 'ww2'
+            WHEN birth_year BETWEEN 1928 AND 1945 THEN 'postwar'
+            WHEN birth_year BETWEEN 1946 AND 1954 THEN 'boomer1'
+            WHEN birth_year BETWEEN 1955 AND 1964 THEN 'boomer2'
+            WHEN birth_year BETWEEN 1965 AND 1980 THEN 'genx'
+            WHEN birth_year BETWEEN 1981 AND 1996 THEN 'millennial'
+            WHEN birth_year BETWEEN 1997 AND 2012 THEN 'zoomer'
+            WHEN birth_year >= 2013 THEN 'gena'
+        END AS generation,
+        party_cd as party,
+        full_phone_number is not null as has_phone,
+        race_code as race,
+        ethnic_code as ethnicity
+    FROM whole
+    """
+
+    outer_query = f"""
+    SELECT count(*) as freq, {agg_cols_str}
+    FROM ({inner_query}) inn
+    WHERE county_id = $county_id
+     AND precinct_id = $precinct_id
+     {preds_str}
+    GROUP BY {agg_cols_str}
+    ORDER BY {agg_cols_str}, freq DESC
+    """
+
+
+    def _row_formatter(row):
+        kwargs = {
+            "freq": row[0]
+        }
+        for col_idx, colname in enumerate(agg_cols):
+            kwargs[colname] = row[col_idx + 1]
+        return StatsResponse(**kwargs)
+
+    return [
+        _row_formatter(row)
+        for row in whole_db.execute(outer_query, sql_named_params).fetchall()
     ]
