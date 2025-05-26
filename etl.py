@@ -105,7 +105,20 @@ def download_latest_zip(statewide_zips):
 def load_csv(con, table_name, date):
     csv_path = ZIP_DIR + f"/{date}/ncvoter_Statewide.txt.zst"
     con.execute(
-        f"CREATE TABLE {table_name} AS FROM read_csv('{csv_path}', delim = '\t', encoding='utf-8', header = true, sample_size=-1) WHERE status_cd = 'A'"
+        f"""
+        CREATE TABLE {table_name} AS
+        FROM read_csv(
+            '{csv_path}',
+            delim = '\t',
+            encoding='utf-8',
+            header = true,
+            sample_size=-1
+        )
+        WHERE
+            status_cd = 'A'
+            AND (precinct_abbrv is not null or precinct_abbrv not in ('', ' '))
+            AND (race_code is not null or race_code not in ('', ' '))
+        """
     )
 
 
