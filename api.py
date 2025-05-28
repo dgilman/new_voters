@@ -8,7 +8,7 @@ import enum
 
 import duckdb
 from fastapi import FastAPI, Depends, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 import pydantic
 
 app = FastAPI()
@@ -88,19 +88,10 @@ def _csv_route(
 
     db.execute(query)
 
-    def _csv_writer():
-        while True:
-            rows = db.fetchmany(1000)
-            if not rows:
-                return
-            writer.writerows(rows)
-            yield buffa.getvalue()
-
-            buffa.truncate(0)
-            buffa.seek(0)
-
+    writer.writerows(db.fetchall())
+    buffa.seek(0)
     return StreamingResponse(
-        _csv_writer(),
+        buffa,
         media_type="text/csv",
         headers={
             "Content-Disposition": f"attachment;filename={filename}",
