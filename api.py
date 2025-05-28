@@ -5,6 +5,7 @@ import csv
 import io
 import zoneinfo
 import enum
+import contextlib
 
 import duckdb
 from fastapi import FastAPI, Depends, Query
@@ -32,33 +33,34 @@ def get_delta_db():
 def get_whole_db():
     yield from get_db(os.environ["WORK_DIR"] + "/whole/*/*/*.parquet", "whole")
 
+@contextlib.contextmanager
+def _db_contextmanager(db_getter):
+    # the above only yield a single object but we have to iterate over the generator anyway
+    for db in db_getter():
+        yield db
+
 
 def _make_column_names():
-    db_dep = get_whole_db()
+    with _db_contextmanager(get_whole_db) as whole_db:
 
-    whole_db = next(db_dep)
+        whole_db.execute("DESCRIBE SELECT * FROM whole")
 
-    whole_db.execute("DESCRIBE SELECT * FROM whole")
+        addl_delta_cols = ["delta_date", "county_id", "precinct_abbrv", "street_name"]
+        addl_whole_cols = ["county_id", "precinct_abbrv", "street_name"]
+        db_colnames = [
+            (row[0], row[0]) for row in whole_db.fetchall() if row[0] not in addl_delta_cols
+        ]
 
-    addl_delta_cols = ["delta_date", "county_id", "precinct_abbrv", "street_name"]
-    addl_whole_cols = ["county_id", "precinct_abbrv", "street_name"]
-    db_colnames = [
-        (row[0], row[0]) for row in whole_db.fetchall() if row[0] not in addl_delta_cols
-    ]
+        whole_db.execute("SELECT DISTINCT party_cd FROM whole ORDER BY party_cd")
+        party_enum = enum.StrEnum(
+            "Parties", [(row[0], row[0]) for row in whole_db.fetchall()]
+        )
 
-    whole_db.execute("SELECT DISTINCT party_cd FROM whole ORDER BY party_cd")
-    party_enum = enum.StrEnum(
-        "Parties", [(row[0], row[0]) for row in whole_db.fetchall()]
-    )
+        delta_cols = [(addl_col, addl_col) for addl_col in addl_delta_cols] + db_colnames
+        whole_cols = [(addl_col, addl_col) for addl_col in addl_whole_cols] + db_colnames
 
-    # close connection
-    next(db_dep, None)
-
-    delta_cols = [(addl_col, addl_col) for addl_col in addl_delta_cols] + db_colnames
-    whole_cols = [(addl_col, addl_col) for addl_col in addl_whole_cols] + db_colnames
-
-    delta_col_enum = enum.StrEnum("DeltaColumnNames", delta_cols)
-    whole_col_enum = enum.StrEnum("WholeColumnNames", whole_cols)
+        delta_col_enum = enum.StrEnum("DeltaColumnNames", delta_cols)
+        whole_col_enum = enum.StrEnum("WholeColumnNames", whole_cols)
 
     return delta_col_enum, whole_col_enum, party_enum
 
@@ -80,24 +82,27 @@ class WholeCsvParams(pydantic.BaseModel):
 
 
 def _csv_route(
-    db: duckdb.DuckDBPyConnection, filename: str, cols: list[str], query: str
+    db_getter, filename: str, cols: list[str], query: str
 ):
-    buffa = io.StringIO()
-    writer = csv.writer(buffa)
-    writer.writerow(cols)
-
-    db.execute(query)
-
+    # fastapi will close the dependency-injected database before it starts consuming
+    # the StreamingResponse so we must open our own db connection here.
     def _csv_writer():
-        while True:
-            rows = db.fetchmany(1000)
-            if not rows:
-                return
-            writer.writerows(rows)
-            yield buffa.getvalue()
+        with _db_contextmanager(db_getter) as db:
+            buffa = io.StringIO()
+            writer = csv.writer(buffa)
+            writer.writerow(cols)
 
-            buffa.truncate(0)
-            buffa.seek(0)
+            db.execute(query)
+
+            while True:
+                rows = db.fetchmany(1000)
+                if not rows:
+                    return
+                writer.writerows(rows)
+                yield buffa.getvalue()
+
+                buffa.truncate(0)
+                buffa.seek(0)
 
     return StreamingResponse(
         _csv_writer(),
@@ -112,7 +117,6 @@ def _csv_route(
 @app.post("/delta_csv")
 def delta_csv(
     q: Annotated[DeltaCsvParams, Query()],
-    delta_db: Annotated[duckdb.DuckDBPyConnection, Depends(get_delta_db)],
 ) -> StreamingResponse:
     filename = f"delta_c{q.county_id}"
     if q.precinct_id:
@@ -139,13 +143,12 @@ def delta_csv(
          {precinct_pred}
     """
 
-    return _csv_route(delta_db, filename, cols, query)
+    return _csv_route(get_delta_db, filename, cols, query)
 
 
 @app.post("/whole_csv")
 def whole_csv(
     q: Annotated[WholeCsvParams, Query()],
-    whole_db: Annotated[duckdb.DuckDBPyConnection, Depends(get_whole_db)],
 ) -> StreamingResponse:
     filename = f"delta_c{q.county_id}"
     if q.precinct_id:
@@ -171,7 +174,7 @@ def whole_csv(
          {precinct_pred}
     """
 
-    return _csv_route(whole_db, filename, cols, query)
+    return _csv_route(get_whole_db, filename, cols, query)
 
 
 class CountyDesc(pydantic.BaseModel):
@@ -368,7 +371,10 @@ def get_county_precinct_stats(
     for attr_name in ("generation", "party", "has_phone", "race", "ethnicity"):
         if attr_val := getattr(stats_params, attr_name):
             preds.append(f"{attr_name} = ${attr_name}")
-            sql_named_params[attr_name] = attr_val.value
+            if attr_name == "has_phone":
+                sql_named_params[attr_name] = attr_val
+            else:
+                sql_named_params[attr_name] = attr_val.value
 
     preds_str = ""
     if preds:
